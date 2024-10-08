@@ -1,3 +1,7 @@
+use bytes::Bytes;
+use datafusion::datasource::listing::ListingTableUrl;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
 /*
  * Parseable Server (C) 2022 - 2024 Parseable, Inc.
  *
@@ -15,200 +19,154 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
-
+use super::object_storage::parseable_json_path;
+use super::{
+    LogStream, ObjectStorage, ObjectStorageError, ObjectStorageProvider, PARSEABLE_ROOT_DIRECTORY,
+    SCHEMA_FILE_NAME, STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
+};
 use async_trait::async_trait;
-use bytes::Bytes;
-use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::object_store::{
     DefaultObjectStoreRegistry, ObjectStoreRegistry, ObjectStoreUrl,
 };
 use datafusion::execution::runtime_env::RuntimeConfig;
-use futures::stream::FuturesUnordered;
-use futures::{StreamExt, TryStreamExt};
-use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, Checksum};
-use object_store::limit::LimitStore;
-use object_store::path::Path as StorePath;
+use object_store::azure::{MicrosoftAzure, MicrosoftAzureBuilder};
 use object_store::{ClientOptions, ObjectStore, PutPayload};
 use relative_path::{RelativePath, RelativePathBuf};
-
-use std::collections::BTreeMap;
-use std::iter::Iterator;
 use std::path::Path as StdPath;
+use url::Url;
+
+use super::metrics_layer::MetricLayer;
+use crate::handlers::http::users::USERS_ROOT_DIR;
+use crate::metrics::storage::azureblob::REQUEST_RESPONSE_TIME;
+use crate::metrics::storage::StorageMetrics;
+use object_store::limit::LimitStore;
+use object_store::path::Path as StorePath;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::metrics_layer::MetricLayer;
-use super::object_storage::parseable_json_path;
-use super::{
-    ObjectStorageProvider, SCHEMA_FILE_NAME, STREAM_METADATA_FILE_NAME, STREAM_ROOT_DIRECTORY,
-};
-use crate::handlers::http::users::USERS_ROOT_DIR;
-use crate::metrics::storage::{s3::REQUEST_RESPONSE_TIME, StorageMetrics};
-use crate::storage::{LogStream, ObjectStorage, ObjectStorageError, PARSEABLE_ROOT_DIRECTORY};
-use std::collections::HashMap;
-
-#[allow(dead_code)]
-// in bytes
-const MULTIPART_UPLOAD_SIZE: usize = 1024 * 1024 * 100;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 300;
-const AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: &str = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI";
 
 #[derive(Debug, Clone, clap::Args)]
 #[command(
-    name = "S3 config",
-    about = "Start Parseable with S3 or compatible as storage",
+    name = "Azure config",
+    about = "Start Parseable with Azure Blob storage",
     help_template = "\
 {about-section}
 {all-args}
 "
 )]
-pub struct S3Config {
-    /// The endpoint to AWS S3 or compatible object storage platform
-    #[arg(long, env = "P_S3_URL", value_name = "url", required = true)]
+pub struct AzureBlobConfig {
+    /// The endpoint to Azure Blob Storage
+    /// eg. `https://{account}.blob.core.windows.net`
+    #[arg(long, env = "P_AZR_URL", value_name = "url", required = true)]
     pub endpoint_url: String,
 
-    /// The access key for AWS S3 or compatible object storage platform
-    #[arg(long, env = "P_S3_ACCESS_KEY", value_name = "access-key")]
-    pub access_key_id: Option<String>,
+    // The Azure Storage Account ID
+    #[arg(long, env = "P_AZR_ACCOUNT", value_name = "account", required = true)]
+    pub account: String,
 
-    /// The secret key for AWS S3 or compatible object storage platform
-    #[arg(long, env = "P_S3_SECRET_KEY", value_name = "secret-key")]
-    pub secret_key: Option<String>,
-
-    /// The region for AWS S3 or compatible object storage platform
-    #[arg(long, env = "P_S3_REGION", value_name = "region", required = true)]
-    pub region: String,
-
-    /// The AWS S3 or compatible object storage bucket to be used for storage
-    #[arg(long, env = "P_S3_BUCKET", value_name = "bucket-name", required = true)]
-    pub bucket_name: String,
-
-    /// Set client to send checksum header on every put request
+    /// The Azure Storage Access key
     #[arg(
         long,
-        env = "P_S3_CHECKSUM",
-        value_name = "bool",
-        default_value = "false"
+        env = "P_AZR_ACCESS_KEY",
+        value_name = "access-key",
+        required = true
     )]
-    pub set_checksum: bool,
+    pub access_key: String,
 
-    /// Set client to use virtual hosted style acess
+    ///Client ID
     #[arg(
         long,
-        env = "P_S3_PATH_STYLE",
-        value_name = "bool",
-        default_value = "true"
-    )]
-    pub use_path_style: bool,
-
-    /// Set client to skip tls verification
-    #[arg(
-        long,
-        env = "P_S3_TLS_SKIP_VERIFY",
-        value_name = "bool",
-        default_value = "false"
-    )]
-    pub skip_tls: bool,
-
-    /// Set client to fallback to imdsv1
-    #[arg(
-        long,
-        env = "P_AWS_IMDSV1_FALLBACK",
-        value_name = "bool",
-        default_value = "false"
-    )]
-    pub imdsv1_fallback: bool,
-
-    /// Set instance metadata endpoint to use.
-    #[arg(
-        long,
-        env = "P_AWS_METADATA_ENDPOINT",
-        value_name = "url",
+        env = "P_AZR_CLIENT_ID",
+        value_name = "client-id",
         required = false
     )]
-    pub metadata_endpoint: Option<String>,
+    pub client_id: Option<String>,
+
+    ///Secret ID
+    #[arg(
+        long,
+        env = "P_AZR_CLIENT_SECRET",
+        value_name = "client-secret",
+        required = false
+    )]
+    pub client_secret: Option<String>,
+
+    ///Tenant ID
+    #[arg(
+        long,
+        env = "P_AZR_TENANT_ID",
+        value_name = "tenant-id",
+        required = false
+    )]
+    pub tenant_id: Option<String>,
+
+    /// The container name to be used for storage
+    #[arg(
+        long,
+        env = "P_AZR_CONTAINER",
+        value_name = "container",
+        required = true
+    )]
+    pub container: String,
 }
 
-impl S3Config {
-    fn get_default_builder(&self) -> AmazonS3Builder {
-        let mut client_options = ClientOptions::default()
+impl AzureBlobConfig {
+    fn get_default_builder(&self) -> MicrosoftAzureBuilder {
+        let client_options = ClientOptions::default()
             .with_allow_http(true)
             .with_connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .with_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
 
-        if self.skip_tls {
-            client_options = client_options.with_allow_invalid_certificates(true)
-        }
+        let mut builder = MicrosoftAzureBuilder::new()
+            .with_endpoint(self.endpoint_url.clone())
+            .with_account(&self.account)
+            .with_access_key(&self.access_key)
+            .with_container_name(&self.container);
 
-        let mut builder = AmazonS3Builder::new()
-            .with_region(&self.region)
-            .with_endpoint(&self.endpoint_url)
-            .with_bucket_name(&self.bucket_name)
-            .with_virtual_hosted_style_request(!self.use_path_style)
-            .with_allow_http(true);
-
-        if self.set_checksum {
-            builder = builder.with_checksum_algorithm(Checksum::SHA256)
-        }
-
-        if let Some((access_key, secret_key)) =
-            self.access_key_id.as_ref().zip(self.secret_key.as_ref())
-        {
-            builder = builder
-                .with_access_key_id(access_key)
-                .with_secret_access_key(secret_key);
-        }
-
-        if let Ok(relative_uri) = std::env::var(AWS_CONTAINER_CREDENTIALS_RELATIVE_URI) {
-            builder = builder.with_config(
-                AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
-                relative_uri,
-            );
-        }
-
-        if self.imdsv1_fallback {
-            builder = builder.with_imdsv1_fallback()
-        }
-
-        if let Some(metadata_endpoint) = &self.metadata_endpoint {
-            builder = builder.with_metadata_endpoint(metadata_endpoint)
+        if let (Some(client_id), Some(client_secret), Some(tenant_id)) = (
+            self.client_id.clone(),
+            self.client_secret.clone(),
+            self.tenant_id.clone(),
+        ) {
+            builder = builder.with_client_secret_authorization(client_id, client_secret, tenant_id)
         }
 
         builder.with_client_options(client_options)
     }
 }
 
-impl ObjectStorageProvider for S3Config {
+impl ObjectStorageProvider for AzureBlobConfig {
     fn get_datafusion_runtime(&self) -> RuntimeConfig {
-        let s3 = self.get_default_builder().build().unwrap();
-
+        let azure = self.get_default_builder().build().unwrap();
         // limit objectstore to a concurrent request limit
-        let s3 = LimitStore::new(s3, super::MAX_OBJECT_STORE_REQUESTS);
-        let s3 = MetricLayer::new(s3);
+        let azure = LimitStore::new(azure, super::MAX_OBJECT_STORE_REQUESTS);
+        let azure = MetricLayer::new(azure);
 
         let object_store_registry: DefaultObjectStoreRegistry = DefaultObjectStoreRegistry::new();
-        let url = ObjectStoreUrl::parse(format!("s3://{}", &self.bucket_name)).unwrap();
-        object_store_registry.register_store(url.as_ref(), Arc::new(s3));
+        let url = ObjectStoreUrl::parse(format!("https://{}.blob.core.windows.net", self.account))
+            .unwrap();
+        object_store_registry.register_store(url.as_ref(), Arc::new(azure));
 
         RuntimeConfig::new().with_object_store_registry(Arc::new(object_store_registry))
     }
 
-    fn get_object_store(&self) -> Arc<dyn ObjectStorage + Send> {
-        let s3 = self.get_default_builder().build().unwrap();
-
+    fn get_object_store(&self) -> Arc<dyn super::ObjectStorage + Send> {
+        let azure = self.get_default_builder().build().unwrap();
         // limit objectstore to a concurrent request limit
-        let s3 = LimitStore::new(s3, super::MAX_OBJECT_STORE_REQUESTS);
-
-        Arc::new(S3 {
-            client: s3,
-            bucket: self.bucket_name.clone(),
+        let azure = LimitStore::new(azure, super::MAX_OBJECT_STORE_REQUESTS);
+        Arc::new(BlobStore {
+            client: azure,
+            account: self.account.clone(),
+            container: self.container.clone(),
             root: StorePath::from(""),
         })
     }
 
     fn get_endpoint(&self) -> String {
-        format!("{}/{}", self.endpoint_url, self.bucket_name)
+        self.endpoint_url.clone()
     }
 
     fn register_store_metrics(&self, handler: &actix_web_prometheus::PrometheusMetrics) {
@@ -216,20 +174,22 @@ impl ObjectStorageProvider for S3Config {
     }
 }
 
-fn to_object_store_path(path: &RelativePath) -> StorePath {
+pub fn to_object_store_path(path: &RelativePath) -> StorePath {
     StorePath::from(path.as_str())
 }
 
-pub struct S3 {
-    client: LimitStore<AmazonS3>,
-    bucket: String,
+// ObjStoreClient is generic client to enable interactions with different cloudprovider's
+// object store such as S3 and Azure Blob
+pub struct BlobStore {
+    client: LimitStore<MicrosoftAzure>,
+    account: String,
+    container: String,
     root: StorePath,
 }
 
-impl S3 {
+impl BlobStore {
     async fn _get_object(&self, path: &RelativePath) -> Result<Bytes, ObjectStorageError> {
         let instant = Instant::now();
-
         let resp = self.client.get(&to_object_store_path(path)).await;
 
         match resp {
@@ -265,12 +225,9 @@ impl S3 {
             .observe(time);
 
         if let Err(object_store::Error::NotFound { source, .. }) = &resp {
-            let source_str = source.to_string();
-            if source_str.contains("<Code>NoSuchBucket</Code>") {
-                return Err(ObjectStorageError::Custom(
-                    format!("Bucket '{}' does not exist in S3.", self.bucket).to_string(),
-                ));
-            }
+            return Err(ObjectStorageError::Custom(
+                format!("Failed to upload, error: {:?}", source).to_string(),
+            ));
         }
 
         resp.map(|_| ()).map_err(|err| err.into())
@@ -390,7 +347,7 @@ impl S3 {
         } else {
             let bytes = tokio::fs::read(path).await?;
             let result = self.client.put(&key.into(), bytes.into()).await?;
-            log::info!("Uploaded file to S3: {:?}", result);
+            log::info!("Uploaded file to Azure Blob Storage: {:?}", result);
             Ok(())
         };
 
@@ -448,7 +405,7 @@ impl S3 {
 }
 
 #[async_trait]
-impl ObjectStorage for S3 {
+impl ObjectStorage for BlobStore {
     async fn get_object(&self, path: &RelativePath) -> Result<Bytes, ObjectStorageError> {
         Ok(self._get_object(path).await?)
     }
@@ -667,14 +624,18 @@ impl ObjectStorage for S3 {
         prefixes
             .into_iter()
             .map(|prefix| {
-                let path = format!("s3://{}/{}", &self.bucket, prefix);
+                let path = format!(
+                    "https://{}.blob.core.windows.net/{}/{}",
+                    self.account, self.container, prefix
+                );
                 ListingTableUrl::parse(path).unwrap()
             })
             .collect()
     }
 
-    fn store_url(&self) -> url::Url {
-        url::Url::parse(&format!("s3://{}", self.bucket)).unwrap()
+    fn store_url(&self) -> Url {
+        let url_string = format!("https://{}.blob.core.windows.net", self.account);
+        Url::parse(&url_string).unwrap()
     }
 
     async fn list_dirs(&self) -> Result<Vec<String>, ObjectStorageError> {
@@ -777,24 +738,6 @@ impl ObjectStorage for S3 {
     }
 
     fn get_bucket_name(&self) -> String {
-        self.bucket.clone()
-    }
-}
-
-impl From<object_store::Error> for ObjectStorageError {
-    fn from(error: object_store::Error) -> Self {
-        match error {
-            object_store::Error::Generic { source, .. } => {
-                ObjectStorageError::UnhandledError(source)
-            }
-            object_store::Error::NotFound { path, .. } => ObjectStorageError::NoSuchKey(path),
-            err => ObjectStorageError::UnhandledError(Box::new(err)),
-        }
-    }
-}
-
-impl From<serde_json::Error> for ObjectStorageError {
-    fn from(error: serde_json::Error) -> Self {
-        ObjectStorageError::UnhandledError(Box::new(error))
+        self.container.clone()
     }
 }
